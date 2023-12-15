@@ -1,0 +1,408 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Deploy enhanced backup Lambda Functions.
+Parameters:
+  CustomerName:
+    Type: String
+    Description: Name of the subfolder for the Lambda function environment variable, e.g. 'ExampleBucket/ExampleSubfolder/AccountID/...'
+  BucketName:
+    Type: String
+    Description: Name of the destination bucket for the Lambda function environment variable - Note this is just the bucket name, not the ARN.
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 
+        Fn::Sub: "ENB_Role_${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName:
+            Fn::Sub: "ENB_Policy_${AWS::Region}"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "ec2:DescribeInstances"
+                  - "ec2:DescribeNetworkAcls"
+                  - "ec2:DescribeSecurityGroups"
+                  - "sts:GetCallerIdentity"
+                  - "s3:PutObject"
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "lambda:ListFunctions"
+                  - "lambda:GetFunction"
+                  - "cloudformation:DescribeStacks"
+                  - "cloudformation:GetTemplate"
+                  - "cloudformation:ListStacks"
+                  - "ec2:DescribeVpcs"
+                  - "ec2:DescribeSubnets"
+                  - "ec2:DescribeRouteTables"
+                  - "ec2:DescribeNatGateways"
+                  - "ec2:DescribeVpcPeeringConnections"
+                  - "ec2:DescribeAddresses"
+                Resource: "*"
+
+  LambdaFunctionInstanceInformation:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ENB_InstanceInformation
+      Runtime: python3.10
+      Timeout: 600
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+           Variables:
+            CUSTOMER: !Ref CustomerName
+            BUCKET: !Ref BucketName
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime
+          def datetime_handler(x):
+              if isinstance(x, datetime):
+                  return x.isoformat()
+              raise TypeError("Unknown type")  
+          def get_instance_name(instance):
+              for tag in instance.get('Tags', []):
+                  if tag['Key'] == 'Name':
+                      return tag['Value']
+              return 'N/A'
+          def lambda_handler(event, context):
+              ec2_client = boto3.client('ec2')
+              sts_client = boto3.client('sts')
+              response = ec2_client.describe_instances()
+              account_id = sts_client.get_caller_identity()["Account"]
+              customer = os.getenv('CUSTOMER')
+              for reservation in response['Reservations']:
+                  for instance in reservation['Instances']:
+                      instance_id = instance['InstanceId']
+                      instance['LaunchTime'] = datetime_handler(instance['LaunchTime'])
+                      instance_name = get_instance_name(next((instance for reservation in response['Reservations'] for instance in reservation['Instances'] if instance['InstanceId'] == instance_id), {}))
+                      json_data = json.dumps(instance, indent=4, default=datetime_handler)
+                      folder_name = f'{customer}/{account_id}/Instances/{instance_name}/'
+                      s3_client = boto3.client('s3')
+                      bucket_name = os.getenv('BUCKET')
+                      file_name = f'{folder_name}{instance_name}-config.json'
+                      s3_client.put_object(Body=json_data, Bucket=bucket_name, Key=file_name)      
+  LambdaFunctionNACL:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ENB_NACL
+      Runtime: python3.10
+      Timeout: 600
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+           Variables:
+            CUSTOMER: !Ref CustomerName
+            BUCKET: !Ref BucketName
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          def lambda_handler(event, context):
+              ec2_client = boto3.client('ec2')
+              s3_client = boto3.client('s3')
+              sts_client = boto3.client('sts')
+              account_id = sts_client.get_caller_identity()["Account"]
+              customer = os.getenv('CUSTOMER')
+              response = ec2_client.describe_network_acls()
+              for nacl in response['NetworkAcls']:
+                  nacl_id = nacl['NetworkAclId']
+                  inbound_rules = []
+                  outbound_rules = []
+                  for entry in nacl['Entries']:
+                      if entry['Egress']:
+                          outbound_rules.append(entry)
+                      else:
+                          inbound_rules.append(entry)
+                  nacl_data = {
+                      'NetworkAclId': nacl_id,
+                      'SubnetAssociations': nacl['Associations'],
+                      'InboundRules': inbound_rules,
+                      'OutboundRules': outbound_rules
+                  }
+                  json_data = json.dumps(nacl_data, indent=4)
+                  folder_name = f'{customer}/{account_id}/NACL/{nacl_id}/'
+                  bucket_name = os.getenv('BUCKET')
+                  file_name = f'{folder_name}{nacl_id}-config.json'
+                  s3_client.put_object(Body=json_data, Bucket=bucket_name, Key=file_name)
+  LambdaFunctionSecurityGroups:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ENB_SecurityGroups
+      Runtime: python3.10
+      Timeout: 600
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+           Variables:
+            CUSTOMER: !Ref CustomerName
+            BUCKET: !Ref BucketName
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          def lambda_handler(event, context):
+            ec2_client = boto3.client('ec2')
+            s3_client = boto3.client('s3')
+            sts_client = boto3.client('sts')
+            response = ec2_client.describe_security_groups()
+            account_id = sts_client.get_caller_identity()["Account"]
+            customer = os.getenv('CUSTOMER')
+            for security_group in response['SecurityGroups']:
+                security_group_id = security_group['GroupId']
+                security_group_name = security_group['GroupName']
+                sg_data = {
+                    'SecurityGroupName': security_group_name,
+                    'SecurityGroupId': security_group_id,
+                    'VPC': security_group['VpcId'],
+                    'InboundRules': security_group['IpPermissions'],
+                    'OutboundRules': security_group['IpPermissionsEgress']
+                }
+                json_data = json.dumps(sg_data, indent=4)
+                folder_name = f'{customer}/{account_id}/SecurityGroups/{security_group_id}/'        
+                bucket_name = os.getenv('BUCKET')
+                file_name = f'{folder_name}{security_group_name}-config.json'
+                s3_client.put_object(Body=json_data, Bucket=bucket_name, Key=file_name)
+  LambdaFunctionCloudFormationTemplates:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ENB_CFTemplates
+      Runtime: python3.10
+      Timeout: 600
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+           Variables:
+            CUSTOMER: !Ref CustomerName
+            BUCKET: !Ref BucketName
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+
+          cf= boto3.client('cloudformation')
+          s3 = boto3.client('s3')
+          sts_client = boto3.client('sts')
+
+          def lambda_handler(event, context):
+              stacks = cf.describe_stacks()
+              customer = os.getenv('CUSTOMER')
+              account_id = sts_client.get_caller_identity()["Account"]
+              for stack in stacks['Stacks']:
+                  stack_name = stack['StackName']
+                  template_body = cf.get_template(StackName=stack_name)['TemplateBody']
+                  folder_name = f"{customer}/{account_id}/CloudFormation/"
+                  backup_name = f"{folder_name}{stack_name}/template-backup.json"
+                  bucket_name = os.getenv('BUCKET')
+                  s3.put_object(Body=json.dumps(template_body), Bucket=bucket_name, Key=backup_name)
+  LambdaFunctionVPCItems:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ENB_VPC
+      Runtime: python3.10
+      Timeout: 600
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+           Variables:
+            CUSTOMER: !Ref CustomerName
+            BUCKET: !Ref BucketName
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from datetime import datetime
+          import os
+
+          ec2_client = boto3.client('ec2')
+          s3_client = boto3.client('s3')
+          sts_client = boto3.client('sts')
+
+          def default(o):
+              if isinstance(o, datetime):
+                  return o.isoformat()
+
+          def lambda_handler(event, context):
+              vpcs = ec2_client.describe_vpcs()
+              account_id = sts_client.get_caller_identity()["Account"]
+              customer = os.getenv('CUSTOMER')
+              backup_data = {
+                  "VPCs": []
+              }
+              for vpc in vpcs['Vpcs']:
+                  vpc_id = vpc['VpcId']
+                  subnets = ec2_client.describe_subnets(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}])['Subnets']
+                  route_tables = ec2_client.describe_route_tables(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}])['RouteTables']
+                  nat_gateways = ec2_client.describe_nat_gateways(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}])['NatGateways']
+                  peering_connections = ec2_client.describe_vpc_peering_connections(Filters=[{'Name': 'requester-vpc-info.vpc-id', 'Values': [vpc_id]}])['VpcPeeringConnections']
+                  elastic_ips = ec2_client.describe_addresses(Filters=[{'Name': 'domain', 'Values': ['vpc']}])['Addresses']
+                  vpc_data = {
+                      "VpcId": vpc_id,
+                      "Subnets": subnets,
+                      "RouteTables": route_tables,
+                      "NatGateways": nat_gateways,
+                      "PeeringConnections": peering_connections,
+                      "ElasticIPs": elastic_ips
+                  }
+                  backup_data["VPCs"].append(vpc_data)
+              json_data = json.dumps(backup_data, default=default)
+              folder_name = f'{customer}/{account_id}/VPC/{vpc_id}/'
+              bucket_name = os.getenv('BUCKET')
+              file_name = f'{folder_name}{vpc_id}-config.json'
+              s3_client.put_object(Body=json_data, Bucket=bucket_name, Key=file_name)
+  LambdaFunctionLambdaScripts:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ENB_LambdaScripts
+      Runtime: python3.10
+      Timeout: 600
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+           Variables:
+            CUSTOMER: !Ref CustomerName
+            BUCKET: !Ref BucketName
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import urllib.request
+          import tempfile
+          import json
+          def lambda_handler(event, context):
+              lambda_client = boto3.client('lambda')
+              s3_client = boto3.client('s3')
+              sts_client = boto3.client('sts')
+              account_id = sts_client.get_caller_identity()["Account"]
+              customer = os.getenv('CUSTOMER')
+              functions = lambda_client.list_functions()
+              bucket_name = os.getenv('BUCKET')
+              for function in functions['Functions']:
+                  function_name = function['FunctionName']
+                  function_details = lambda_client.get_function(FunctionName=function_name)
+                  runtime = function_details['Configuration']['Runtime']
+                  role = function_details['Configuration']['Role']
+                  timeout = function_details['Configuration']['Timeout']
+                  memorysize = function_details['Configuration']['MemorySize']
+                  architecture = function_details['Configuration']['Architectures']
+                  code_location = function_details['Code']['Location']
+                  response = urllib.request.urlopen(code_location)
+                  code = response.read()
+                  temp_dir = tempfile.mkdtemp()
+                  with open(os.path.join(temp_dir, 'function.zip'), 'wb') as code_file:
+                      code_file.write(code)
+                  function_info = {
+                      'FunctionName': function_name,
+                      'Runtime': runtime,
+                      'Role': role,
+                      'Timeout': timeout,
+                      'Memory Size' : memorysize,
+                      'Architecture' : architecture
+                  }
+                  config_file_path = os.path.join(temp_dir, 'function_config.json')
+                  with open(config_file_path, 'w') as config_file:
+                      json.dump(function_info, config_file, default=str)
+                  s3_code_key = f'{customer}/{account_id}/Lambdas/{function_name}/{function_name}-function.zip'
+                  s3_client.upload_file(os.path.join(temp_dir, 'function.zip'), bucket_name, s3_code_key)
+                  s3_config_key = f'{customer}/{account_id}/Lambdas/{function_name}/{function_name}-config.json'
+                  s3_client.upload_file(config_file_path, bucket_name, s3_config_key)
+                  os.remove(os.path.join(temp_dir, 'function.zip'))
+                  os.remove(config_file_path)
+                  os.rmdir(temp_dir)
+  TriggerPrimary:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: ENB_CRON1
+      ScheduleExpression: "cron(0 10 ? * * *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LambdaFunctionCloudFormationTemplates.Arn
+          Id: ENBTriggerCloudFormationTemplates
+        - Arn: !GetAtt LambdaFunctionVPCItems.Arn
+          Id: ENBTriggerVPCItems
+        - Arn: !GetAtt LambdaFunctionLambdaScripts.Arn
+          Id: ENBTriggerLambdaScripts
+      EventBusName: default
+      EventPattern:
+        source:
+          - "aws.events"
+        detail-type:
+          - "Scheduled Event"
+  TriggerSecondary:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: ENB_CRON2
+      ScheduleExpression: "cron(0 10 ? * * *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LambdaFunctionInstanceInformation.Arn
+          Id: ENBTriggerInstanceInformation
+        - Arn: !GetAtt LambdaFunctionNACL.Arn
+          Id: ENBTriggerNACL
+        - Arn: !GetAtt LambdaFunctionSecurityGroups.Arn
+          Id: ENBTriggerSecurityGroups
+      EventBusName: default
+      EventPattern:
+        source:
+          - "aws.events"
+        detail-type:
+          - "Scheduled Event"
+
+
+  TriggerPermissionInstanceInformation:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LambdaFunctionInstanceInformation.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TriggerSecondary.Arn
+  TriggerPermissionNACL:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LambdaFunctionNACL.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TriggerSecondary.Arn
+  TriggerPermissionSecurityGroups:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LambdaFunctionSecurityGroups.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TriggerSecondary.Arn
+  TriggerPermissionCloudFormationTemplates:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LambdaFunctionCloudFormationTemplates.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TriggerPrimary.Arn
+  TriggerPermissionVPCItems:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LambdaFunctionVPCItems.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TriggerPrimary.Arn
+  TriggerPermissionLambdaScripts:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LambdaFunctionLambdaScripts.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TriggerPrimary.Arn
